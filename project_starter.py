@@ -8,6 +8,11 @@ from sqlalchemy.sql import text
 from datetime import datetime, timedelta
 from typing import Dict, List, Union
 from sqlalchemy import create_engine, Engine
+from smolagents import ToolCallingAgent, OpenAIServerModel, tool, CodeAgent
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
@@ -580,40 +585,127 @@ def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
         result = conn.execute(text(query), params)
         return [dict(row._mapping) for row in result]
 
-########################
-########################
-########################
-# YOUR MULTI AGENT STARTS HERE
-########################
-########################
-########################
-
-
 # Set up and load your env parameters and instantiate your model.
+model = OpenAIServerModel(
+    model_id="gpt-4o-mini",
+    api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
+    api_base="https://openai.vocareum.com/v1",
+)
 
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
+@tool
+def inventory_tool(item_name: str, as_of_date: str) -> str:
+    """Check stock level for a paper product and whether reorder is needed.
 
-# Tools for inventory agent
+    Args:
+        item_name: The exact name of the product to look up (e.g. 'A4 paper').
+        as_of_date: The date to check stock as of, in YYYY-MM-DD format.
+    """
+    stock_df = get_stock_level(item_name, as_of_date)
+    stock = int(stock_df["current_stock"].iloc[0])
+    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    if inv.empty:
+        return f"{item_name} not found in inventory."
+    row = inv.iloc[0]
+    return json.dumps({
+        "item_name": item_name,
+        "current_stock": stock,
+        "min_stock_level": int(row["min_stock_level"]),
+        "unit_price": float(row["unit_price"]),
+        "needs_reorder": stock < int(row["min_stock_level"])
+    })
 
+@tool
+def delivery_tool(item_name: str, quantity: int, request_date: str) -> str:
+    """Estimate the supplier delivery date for a product order.
 
-# Tools for quoting agent
+    Args:
+        item_name: The name of the product being ordered.
+        quantity: Number of units to order.
+        request_date: The order start date in YYYY-MM-DD format.
+    """
+    delivery = get_supplier_delivery_date(request_date, quantity)
+    return json.dumps({"item_name": item_name, "quantity": quantity, "estimated_delivery": delivery})
 
+@tool
+def quote_tool(item_name: str, quantity: int, as_of_date: str) -> str:
+    """Generate a price quote with bulk discounts and attach similar historical quotes.
 
-# Tools for ordering agent
+    Args:
+        item_name: The exact name of the product to quote.
+        quantity: Number of units the customer wants to purchase.
+        as_of_date: The date of the quote request in YYYY-MM-DD format.
+    """
+    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    if inv.empty:
+        return f"No pricing found for {item_name}."
+    unit_price = float(inv.iloc[0]["unit_price"])
+    discount = 0.15 if quantity >= 1000 else 0.10 if quantity >= 500 else 0.05 if quantity >= 100 else 0.0
+    discounted = unit_price * (1 - discount)
+    history = search_quote_history([item_name], limit=3)
+    return json.dumps({
+        "item_name": item_name, "quantity": quantity,
+        "unit_price": unit_price, "discount_pct": discount * 100,
+        "discounted_unit_price": round(discounted, 4),
+        "total_quote": round(discounted * quantity, 2),
+        "similar_past_quotes": history
+    })
 
+@tool
+def place_order_tool(item_name: str, quantity: int, unit_price: float, transaction_date: str) -> str:
+    """Record a completed sale in the database. Only call after confirming stock is available.
+
+    Args:
+        item_name: The name of the product being sold.
+        quantity: Number of units sold.
+        unit_price: The per-unit price after any discounts.
+        transaction_date: The date of the transaction in YYYY-MM-DD format.
+    """
+    tx_id = create_transaction(item_name, "sales", quantity, quantity * unit_price, transaction_date)
+    return json.dumps({"status": "success", "transaction_id": tx_id,
+                       "item_name": item_name, "quantity_sold": quantity,
+                       "total_revenue": round(quantity * unit_price, 2)})
+
+inventory_agent = ToolCallingAgent(
+    tools=[inventory_tool, delivery_tool],
+    model=model,
+    name="inventory_agent",
+    description="Checks stock levels for products and estimates supplier delivery timelines."
+)
+
+sales_agent = ToolCallingAgent(
+    tools=[quote_tool, place_order_tool],
+    model=model,
+    name="sales_agent",
+    description="Generates price quotes with bulk discounts and records completed sales in the database."
+)
 
 # Set up your agents and create an orchestration agent that will manage them.
-
+orchestrator = CodeAgent(
+    tools=[],
+    model=model,
+    managed_agents=[inventory_agent, sales_agent]
+)
 
 # Run your test scenarios by writing them here. Make sure to keep track of them.
+print("Initializing Database...")
+init_database(db_engine)
+
+result = orchestrator.run(
+    "A customer wants 750 units of Envelopes by 2025-03-15. "
+    "Check if we have enough stock, generate a quote, and place the order if stock allows."
+)
+print(result)
+
+
 
 def run_test_scenarios():
     
     print("Initializing Database...")
-    init_database()
+    init_database(db_engine)
     try:
         quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
         quote_requests_sample["request_date"] = pd.to_datetime(
@@ -631,13 +723,11 @@ def run_test_scenarios():
     current_cash = report["cash_balance"]
     current_inventory = report["inventory_value"]
 
-    ############
-    ############
-    ############
-    # INITIALIZE YOUR MULTI AGENT SYSTEM HERE
-    ############
-    ############
-    ############
+    orchestrator = CodeAgent(
+        tools=[],
+        model=model,
+        managed_agents=[inventory_agent, sales_agent]
+)
 
     results = []
     for idx, row in quote_requests_sample.iterrows():
@@ -652,15 +742,7 @@ def run_test_scenarios():
         # Process request
         request_with_date = f"{row['request']} (Date of request: {request_date})"
 
-        ############
-        ############
-        ############
-        # USE YOUR MULTI AGENT SYSTEM TO HANDLE THE REQUEST
-        ############
-        ############
-        ############
-
-        # response = call_your_multi_agent_system(request_with_date)
+        response = orchestrator.run(request_with_date)
 
         # Update state
         report = generate_financial_report(request_date)
