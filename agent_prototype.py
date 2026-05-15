@@ -1,8 +1,8 @@
 import pandas as pd
 import numpy as np
 import os
+import io,sys
 import time
-import dotenv
 import ast
 from sqlalchemy.sql import text
 from datetime import datetime, timedelta
@@ -13,20 +13,44 @@ import json
 from dotenv import load_dotenv
 
 load_dotenv()
-from smolagents import ToolCallingAgent, OpenAIServerModel, tool, CodeAgent
-import json
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # Create an SQLite database
 db_engine = create_engine("sqlite:///munder_difflin.db")
+
+# adding class for capturing the test run output to a md file. 
+class TeeOutput:
+    def __init__(self, filename, title):
+        self.filename = filename
+        self.title = title
+        self.buffer = io.StringIO()
+
+    def __enter__(self):
+        self._stdout = sys.stdout
+        sys.stdout = self
+        return self
+
+    def write(self, text):
+        self._stdout.write(text)
+        self.buffer.write(text)
+
+    def flush(self):
+        self._stdout.flush()
+
+    def __exit__(self, *args):
+        sys.stdout = self._stdout
+        with open(self.filename, "w") as f:
+            f.write(f"# {self.title}\n\n")
+            f.write(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
+            f.write("```\n")
+            f.write(self.buffer.getvalue())
+            f.write("```\n")
+
 
 # List containing the different kinds of papers 
 paper_supplies = [
     # Paper Types (priced per sheet unless specified)
     {"item_name": "A4 paper",                         "category": "paper",        "unit_price": 0.05},
-    {"item_name": "Letter-sized paper",              "category": "paper",        "unit_price": 0.06},
+    {"item_name": "Letter-sized paper",               "category": "paper",        "unit_price": 0.06},
     {"item_name": "Cardstock",                        "category": "paper",        "unit_price": 0.15},
     {"item_name": "Colored paper",                    "category": "paper",        "unit_price": 0.10},
     {"item_name": "Glossy paper",                     "category": "paper",        "unit_price": 0.20},
@@ -52,21 +76,21 @@ paper_supplies = [
     {"item_name": "Patterned paper",                  "category": "paper",        "unit_price": 0.15},
 
     # Product Types (priced per unit)
-    {"item_name": "Paper plates",                     "category": "product",      "unit_price": 0.10},  # per plate
-    {"item_name": "Paper cups",                       "category": "product",      "unit_price": 0.08},  # per cup
-    {"item_name": "Paper napkins",                    "category": "product",      "unit_price": 0.02},  # per napkin
-    {"item_name": "Disposable cups",                  "category": "product",      "unit_price": 0.10},  # per cup
-    {"item_name": "Table covers",                     "category": "product",      "unit_price": 1.50},  # per cover
-    {"item_name": "Envelopes",                        "category": "product",      "unit_price": 0.05},  # per envelope
-    {"item_name": "Sticky notes",                     "category": "product",      "unit_price": 0.03},  # per sheet
-    {"item_name": "Notepads",                         "category": "product",      "unit_price": 2.00},  # per pad
-    {"item_name": "Invitation cards",                 "category": "product",      "unit_price": 0.50},  # per card
-    {"item_name": "Flyers",                           "category": "product",      "unit_price": 0.15},  # per flyer
-    {"item_name": "Party streamers",                  "category": "product",      "unit_price": 0.05},  # per roll
-    {"item_name": "Decorative adhesive tape (washi tape)", "category": "product", "unit_price": 0.20},  # per roll
-    {"item_name": "Paper party bags",                 "category": "product",      "unit_price": 0.25},  # per bag
-    {"item_name": "Name tags with lanyards",          "category": "product",      "unit_price": 0.75},  # per tag
-    {"item_name": "Presentation folders",             "category": "product",      "unit_price": 0.50},  # per folder
+    {"item_name": "Paper plates",                           "category": "product",      "unit_price": 0.10},  # per plate
+    {"item_name": "Paper cups",                             "category": "product",      "unit_price": 0.08},  # per cup
+    {"item_name": "Paper napkins",                          "category": "product",      "unit_price": 0.02},  # per napkin
+    {"item_name": "Disposable cups",                        "category": "product",      "unit_price": 0.10},  # per cup
+    {"item_name": "Table covers",                           "category": "product",      "unit_price": 1.50},  # per cover
+    {"item_name": "Envelopes",                              "category": "product",      "unit_price": 0.05},  # per envelope
+    {"item_name": "Sticky notes",                           "category": "product",      "unit_price": 0.03},  # per sheet
+    {"item_name": "Notepads",                               "category": "product",      "unit_price": 2.00},  # per pad
+    {"item_name": "Invitation cards",                       "category": "product",      "unit_price": 0.50},  # per card
+    {"item_name": "Flyers",                                 "category": "product",      "unit_price": 0.15},  # per flyer
+    {"item_name": "Party streamers",                        "category": "product",      "unit_price": 0.05},  # per roll
+    {"item_name": "Decorative adhesive tape (washi tape)",  "category": "product",      "unit_price": 0.20},  # per roll
+    {"item_name": "Paper party bags",                       "category": "product",      "unit_price": 0.25},  # per bag
+    {"item_name": "Name tags with lanyards",                "category": "product",      "unit_price": 0.75},  # per tag
+    {"item_name": "Presentation folders",                   "category": "product",      "unit_price": 0.50},  # per folder
 
     # Large-format items (priced per unit)
     {"item_name": "Large poster paper (24x36 inches)", "category": "large_format", "unit_price": 1.00},
@@ -249,6 +273,7 @@ def init_database(db_engine: Engine, seed: int = 137) -> Engine:
         print(f"Error initializing database: {e}")
         raise
 
+@tool
 def create_transaction(
     item_name: str,
     transaction_type: str,
@@ -302,6 +327,7 @@ def create_transaction(
         print(f"Error creating transaction: {e}")
         raise
 
+@tool
 def get_all_inventory(as_of_date: str) -> Dict[str, int]:
     """
     Retrieve a snapshot of available inventory as of a specific date.
@@ -339,6 +365,7 @@ def get_all_inventory(as_of_date: str) -> Dict[str, int]:
     # Convert the result into a dictionary {item_name: stock}
     return dict(zip(result["item_name"], result["stock"]))
 
+@tool
 def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.DataFrame:
     """
     Retrieve the stock level of a specific item as of a given date.
@@ -378,6 +405,7 @@ def get_stock_level(item_name: str, as_of_date: Union[str, datetime]) -> pd.Data
         params={"item_name": item_name, "as_of_date": as_of_date},
     )
 
+@tool
 def get_supplier_delivery_date(input_date_str: str, quantity: int) -> str:
     """
     Estimate the supplier delivery date based on the requested order quantity and a starting date.
@@ -422,6 +450,7 @@ def get_supplier_delivery_date(input_date_str: str, quantity: int) -> str:
     # Return formatted delivery date
     return delivery_date_dt.strftime("%Y-%m-%d")
 
+@tool
 def get_cash_balance(as_of_date: Union[str, datetime]) -> float:
     """
     Calculate the current cash balance as of a specified date.
@@ -459,7 +488,7 @@ def get_cash_balance(as_of_date: Union[str, datetime]) -> float:
         print(f"Error getting cash balance: {e}")
         return 0.0
 
-
+@tool
 def generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
     """
     Generate a complete financial report for the company as of a specific date.
@@ -530,7 +559,7 @@ def generate_financial_report(as_of_date: Union[str, datetime]) -> Dict:
         "top_selling_products": top_selling_products,
     }
 
-
+@tool
 def search_quote_history(search_terms: List[str], limit: int = 5) -> List[Dict]:
     """
     Retrieve a list of historical quotes that match any of the provided search terms.
@@ -596,11 +625,6 @@ model = OpenAIServerModel(
     api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
     api_base="https://openai.vocareum.com/v1",
 )
-model = OpenAIServerModel(
-    model_id="gpt-4o-mini",
-    api_key=os.getenv("UDACITY_OPENAI_API_KEY"),
-    api_base="https://openai.vocareum.com/v1",
-)
 
 
 """Set up tools for your agents to use, these should be methods that combine the database functions above
@@ -611,103 +635,21 @@ def inventory_tool(item_name: str, as_of_date: str) -> str:
     """Check stock level for a paper product and whether reorder is needed.
 
     Args:
-        item_name: The exact name of the product to look up (e.g. 'A4 paper').
+        item_name: The exact name of the product to look up (e.g. 'A4 paper'),
+                   or the closest match if the exact name is not found.
         as_of_date: The date to check stock as of, in YYYY-MM-DD format.
     """
-    stock_df = get_stock_level(item_name, as_of_date)
-    stock = int(stock_df["current_stock"].iloc[0])
     inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    if inv.empty:
+        inv = pd.read_sql("SELECT * FROM inventory WHERE item_name LIKE :n", db_engine, params={"n": f"%{item_name}%"})
     if inv.empty:
         return f"{item_name} not found in inventory."
     row = inv.iloc[0]
-    return json.dumps({
-        "item_name": item_name,
-        "current_stock": stock,
-        "min_stock_level": int(row["min_stock_level"]),
-        "unit_price": float(row["unit_price"]),
-        "needs_reorder": stock < int(row["min_stock_level"])
-    })
-
-@tool
-def delivery_tool(item_name: str, quantity: int, request_date: str) -> str:
-    """Estimate the supplier delivery date for a product order.
-
-    Args:
-        item_name: The name of the product being ordered.
-        quantity: Number of units to order.
-        request_date: The order start date in YYYY-MM-DD format.
-    """
-    delivery = get_supplier_delivery_date(request_date, quantity)
-    return json.dumps({"item_name": item_name, "quantity": quantity, "estimated_delivery": delivery})
-
-@tool
-def quote_tool(item_name: str, quantity: int, as_of_date: str) -> str:
-    """Generate a price quote with bulk discounts and attach similar historical quotes.
-
-    Args:
-        item_name: The exact name of the product to quote.
-        quantity: Number of units the customer wants to purchase.
-        as_of_date: The date of the quote request in YYYY-MM-DD format.
-    """
-    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
-    if inv.empty:
-        return f"No pricing found for {item_name}."
-    unit_price = float(inv.iloc[0]["unit_price"])
-    discount = 0.15 if quantity >= 1000 else 0.10 if quantity >= 500 else 0.05 if quantity >= 100 else 0.0
-    discounted = unit_price * (1 - discount)
-    history = search_quote_history([item_name], limit=3)
-    return json.dumps({
-        "item_name": item_name, "quantity": quantity,
-        "unit_price": unit_price, "discount_pct": discount * 100,
-        "discounted_unit_price": round(discounted, 4),
-        "total_quote": round(discounted * quantity, 2),
-        "similar_past_quotes": history
-    })
-
-@tool
-def place_order_tool(item_name: str, quantity: int, unit_price: float, transaction_date: str) -> str:
-    """Record a completed sale in the database. Only call after confirming stock is available.
-
-    Args:
-        item_name: The name of the product being sold.
-        quantity: Number of units sold.
-        unit_price: The per-unit price after any discounts.
-        transaction_date: The date of the transaction in YYYY-MM-DD format.
-    """
-    tx_id = create_transaction(item_name, "sales", quantity, quantity * unit_price, transaction_date)
-    return json.dumps({"status": "success", "transaction_id": tx_id,
-                       "item_name": item_name, "quantity_sold": quantity,
-                       "total_revenue": round(quantity * unit_price, 2)})
-
-inventory_agent = ToolCallingAgent(
-    tools=[inventory_tool, delivery_tool],
-    model=model,
-    name="inventory_agent",
-    description="Checks stock levels for products and estimates supplier delivery timelines."
-)
-
-sales_agent = ToolCallingAgent(
-    tools=[quote_tool, place_order_tool],
-    model=model,
-    name="sales_agent",
-    description="Generates price quotes with bulk discounts and records completed sales in the database."
-)
-@tool
-def inventory_tool(item_name: str, as_of_date: str) -> str:
-    """Check stock level for a paper product and whether reorder is needed.
-
-    Args:
-        item_name: The exact name of the product to look up (e.g. 'A4 paper').
-        as_of_date: The date to check stock as of, in YYYY-MM-DD format.
-    """
-    stock_df = get_stock_level(item_name, as_of_date)
+    matched_name = row["item_name"]
+    stock_df = get_stock_level(matched_name, as_of_date)
     stock = int(stock_df["current_stock"].iloc[0])
-    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
-    if inv.empty:
-        return f"{item_name} not found in inventory."
-    row = inv.iloc[0]
     return json.dumps({
-        "item_name": item_name,
+        "item_name": matched_name,
         "current_stock": stock,
         "min_stock_level": int(row["min_stock_level"]),
         "unit_price": float(row["unit_price"]),
@@ -779,104 +721,131 @@ sales_agent = ToolCallingAgent(
     description="Generates price quotes with bulk discounts and records completed sales in the database."
 )
 
-# Set up your agents and create an orchestration agent that will manage them.
-orchestrator = CodeAgent(
-    tools=[],
-    model=model,
-    managed_agents=[inventory_agent, sales_agent]
-)
 orchestrator = CodeAgent(
     tools=[],
     model=model,
     managed_agents=[inventory_agent, sales_agent]
 )
 
-# Run your test scenarios by writing them here. Make sure to keep track of them.
-print("Initializing Database...")
-init_database(db_engine)
 
-result = orchestrator.run(
-    "A customer wants 750 units of Envelopes by 2025-03-15. "
-    "Check if we have enough stock, generate a quote, and place the order if stock allows."
-)
-print(result)
-
+def run_limited_test():
+    with TeeOutput("limited_test.md", "Limited Test Results"):
+        # export test output to md file. 
+        test_item = inventory_df.iloc[0]['item_name']
+        print(f"\n--- Running Test for Item: {test_item} ---")
+        
+    # Pick a specific item that we know exists
+    test_item = inventory_df.iloc[0]['item_name']
+    print(f"\n--- Running Test for Item: {test_item} ---")
+    
+    # Check starting cash balance
+    initial_cash = get_cash_balance("2025-01-01")
+    print(f"Starting Cash Balance: ${initial_cash:.2f}")
+    
+    request = f"A customer wants 50 units of {test_item} on 2025-01-10. Check stock, and if available, generate a quote and place the order."
+    print(f"\nPrompt: {request}")
+    
+    # Run orchestrator
+    result = orchestrator.run(request)
+    print(f"\nResult: {result}")
+    
+    # Verify financial changes
+    final_cash = get_cash_balance("2025-01-10")
+    print(f"\nEnding Cash Balance: ${final_cash:.2f}")
+    
+    if final_cash > initial_cash:
+        print("SUCCESS: Cash balance increased, indicating a successful sale.")
+    else:
+        print("FAILED: Cash balance did not increase. Sale was not processed.")
+    
+    return result
 
 
 def run_test_scenarios():
-    
-    print("Initializing Database...")
-    init_database(db_engine)
-    try:
-        quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
-        quote_requests_sample["request_date"] = pd.to_datetime(
-            quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
-        )
-        quote_requests_sample.dropna(subset=["request_date"], inplace=True)
-        quote_requests_sample = quote_requests_sample.sort_values("request_date")
-    except Exception as e:
-        print(f"FATAL: Error loading test data: {e}")
-        return
-
-    # Get initial state
-    initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
-    report = generate_financial_report(initial_date)
-    current_cash = report["cash_balance"]
-    current_inventory = report["inventory_value"]
-
-    orchestrator = CodeAgent(
-        tools=[],
-        model=model,
-        managed_agents=[inventory_agent, sales_agent]
-)
-
     results = []
-    for idx, row in quote_requests_sample.iterrows():
-        request_date = row["request_date"].strftime("%Y-%m-%d")
+    # write the test output to a markdown file
+    with TeeOutput("all_test_scenarios.md", "All Test Scenarios"):
+        try:
+            quote_requests_sample = pd.read_csv("quote_requests_sample.csv")
+            quote_requests_sample["request_date"] = pd.to_datetime(
+                quote_requests_sample["request_date"], format="%m/%d/%y", errors="coerce"
+            )
+            quote_requests_sample.dropna(subset=["request_date"], inplace=True)
+            quote_requests_sample = quote_requests_sample.sort_values("request_date")
+        except Exception as e:
+            print(f"FATAL: Error loading test data: {e}")
+            return results
 
-        print(f"\n=== Request {idx+1} ===")
-        print(f"Context: {row['job']} organizing {row['event']}")
-        print(f"Request Date: {request_date}")
-        print(f"Cash Balance: ${current_cash:.2f}")
-        print(f"Inventory Value: ${current_inventory:.2f}")
-
-        # Process request
-        request_with_date = f"{row['request']} (Date of request: {request_date})"
-
-        response = orchestrator.run(request_with_date)
-
-        # Update state
-        report = generate_financial_report(request_date)
+        # Get initial state
+        initial_date = quote_requests_sample["request_date"].min().strftime("%Y-%m-%d")
+        report = generate_financial_report(initial_date)
         current_cash = report["cash_balance"]
         current_inventory = report["inventory_value"]
 
-        print(f"Response: {response}")
-        print(f"Updated Cash: ${current_cash:.2f}")
-        print(f"Updated Inventory: ${current_inventory:.2f}")
-
-        results.append(
-            {
-                "request_id": idx + 1,
-                "request_date": request_date,
-                "cash_balance": current_cash,
-                "inventory_value": current_inventory,
-                "response": response,
-            }
+        orchestrator = CodeAgent(
+            tools=[],
+            model=model,
+            managed_agents=[inventory_agent, sales_agent]
         )
 
-        time.sleep(1)
+        for idx, row in quote_requests_sample.iterrows():
+            request_date = row["request_date"].strftime("%Y-%m-%d")
 
-    # Final report
-    final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
-    final_report = generate_financial_report(final_date)
-    print("\n===== FINAL FINANCIAL REPORT =====")
-    print(f"Final Cash: ${final_report['cash_balance']:.2f}")
-    print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
+            print(f"\n=== Request {idx+1} ===")
+            print(f"Context: {row['job']} organizing {row['event']}")
+            print(f"Request Date: {request_date}")
+            print(f"Cash Balance: ${current_cash:.2f}")
+            print(f"Inventory Value: ${current_inventory:.2f}")
 
-    # Save results
+            # Process request
+            request_with_date = f"{row['request']} (Date of request: {request_date})"
+
+            try:
+                response = orchestrator.run(request_with_date)
+            except Exception as e:
+                print(f"ERROR processing request {idx+1}: {e}")
+                response = f"ERROR: {e}"
+
+            # Update state
+            report = generate_financial_report(request_date)
+            current_cash = report["cash_balance"]
+            current_inventory = report["inventory_value"]
+
+            print(f"Response: {response}")
+            print(f"Updated Cash: ${current_cash:.2f}")
+            print(f"Updated Inventory: ${current_inventory:.2f}")
+
+            results.append(
+                {
+                    "request_id": idx + 1,
+                    "request_date": request_date,
+                    "cash_balance": current_cash,
+                    "inventory_value": current_inventory,
+                    "response": response,
+                }
+            )
+
+            time.sleep(1)
+
+        # Final report
+        final_date = quote_requests_sample["request_date"].max().strftime("%Y-%m-%d")
+        final_report = generate_financial_report(final_date)
+        print("\n===== FINAL FINANCIAL REPORT =====")
+        print(f"Final Cash: ${final_report['cash_balance']:.2f}")
+        print(f"Final Inventory: ${final_report['inventory_value']:.2f}")
+
+    # Save results outside the TeeOutput block so it always runs
     pd.DataFrame(results).to_csv("test_results.csv", index=False)
     return results
 
-
 if __name__ == "__main__":
-    results = run_test_scenarios()
+    print("Initializing Database...")
+    init_database(db_engine)
+    print(get_all_inventory(""))
+    inventory_df = pd.read_sql("SELECT item_name, current_stock FROM inventory", db_engine)
+    print("\n--- Available Inventory Items ---")
+    print(inventory_df.head(25))
+           
+    #run_test_scenarios() # Uncomment to run full test scenarios with quote_requests_sample.csv
+    run_limited_test() # Run a single test with a known item and quantity to verify end-to-end functionality
+   
