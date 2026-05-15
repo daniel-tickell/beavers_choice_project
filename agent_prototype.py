@@ -630,7 +630,7 @@ model = OpenAIServerModel(
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
-DB_INIT_DATE = "2025-01-01"
+DB_INIT_DATE = "2025-01-02"
 
 def _clamp_date(date_str: str) -> str:
     """Clamp date to [DB_INIT_DATE, today] so hallucinated old dates don't yield empty results."""
@@ -642,37 +642,6 @@ def _clamp_date(date_str: str) -> str:
     except Exception:
         return datetime.now().strftime("%Y-%m-%d")
 
-def _find_catalog_row(item_name: str) -> pd.DataFrame:
-    """Find the best-matching inventory row for a given item description.
-
-    Tries three strategies in order:
-    1. Exact match on item_name.
-    2. Catalog name contains the search term (search term is substring of catalog name).
-    3. Search term contains the catalog name (catalog name is substring of search term) —
-       this handles descriptive customer names like 'high-quality glossy paper' matching 'Glossy paper'.
-    """
-    # 1. Exact match
-    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
-    if not inv.empty:
-        return inv
-
-    # 2. Standard LIKE: catalog name contains the search term
-    inv = pd.read_sql(
-        "SELECT * FROM inventory WHERE LOWER(item_name) LIKE :n",
-        db_engine,
-        params={"n": f"%{item_name.lower()}%"},
-    )
-    if not inv.empty:
-        return inv
-
-    # 3. Reverse LIKE: search term contains the catalog name
-    all_inv = pd.read_sql("SELECT * FROM inventory", db_engine)
-    search_lower = item_name.lower()
-    for _, row in all_inv.iterrows():
-        if row["item_name"].lower() in search_lower:
-            return pd.DataFrame([row])
-
-    return pd.DataFrame()
 
 @tool
 def inventory_tool(item_name: Union[str, int], as_of_date: str) -> str:
@@ -686,7 +655,9 @@ def inventory_tool(item_name: Union[str, int], as_of_date: str) -> str:
     """
     item_name = str(item_name)
     as_of_date = _clamp_date(as_of_date)
-    inv = _find_catalog_row(item_name)
+    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    if inv.empty:
+        inv = pd.read_sql("SELECT * FROM inventory WHERE item_name LIKE :n", db_engine, params={"n": f"%{item_name}%"})
     if inv.empty:
         return json.dumps({"found": False, "item_name": item_name,
                            "message": f"{item_name} not found in catalog."})
@@ -727,7 +698,9 @@ def quote_tool(item_name: Union[str, int], quantity: int, as_of_date: str) -> st
     """
     item_name = str(item_name)
     as_of_date = _clamp_date(as_of_date)
-    inv = _find_catalog_row(item_name)
+    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    if inv.empty:
+        inv = pd.read_sql("SELECT * FROM inventory WHERE item_name LIKE :n", db_engine, params={"n": f"%{item_name}%"})
     if inv.empty:
         return json.dumps({"error": f"No pricing found for '{item_name}'. Item not in catalog."})
     matched_name = inv.iloc[0]["item_name"]
