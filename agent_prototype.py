@@ -630,31 +630,77 @@ model = OpenAIServerModel(
 """Set up tools for your agents to use, these should be methods that combine the database functions above
  and apply criteria to them to ensure that the flow of the system is correct."""
 
+DB_INIT_DATE = "2025-01-01"
+
+def _clamp_date(date_str: str) -> str:
+    """Clamp date to [DB_INIT_DATE, today] so hallucinated old dates don't yield empty results."""
+    try:
+        d = datetime.fromisoformat(date_str.split("T")[0])
+        d = max(d, datetime.fromisoformat(DB_INIT_DATE))
+        d = min(d, datetime.now())
+        return d.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now().strftime("%Y-%m-%d")
+
+def _find_catalog_row(item_name: str) -> pd.DataFrame:
+    """Find the best-matching inventory row for a given item description.
+
+    Tries three strategies in order:
+    1. Exact match on item_name.
+    2. Catalog name contains the search term (search term is substring of catalog name).
+    3. Search term contains the catalog name (catalog name is substring of search term) —
+       this handles descriptive customer names like 'high-quality glossy paper' matching 'Glossy paper'.
+    """
+    # 1. Exact match
+    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    if not inv.empty:
+        return inv
+
+    # 2. Standard LIKE: catalog name contains the search term
+    inv = pd.read_sql(
+        "SELECT * FROM inventory WHERE LOWER(item_name) LIKE :n",
+        db_engine,
+        params={"n": f"%{item_name.lower()}%"},
+    )
+    if not inv.empty:
+        return inv
+
+    # 3. Reverse LIKE: search term contains the catalog name
+    all_inv = pd.read_sql("SELECT * FROM inventory", db_engine)
+    search_lower = item_name.lower()
+    for _, row in all_inv.iterrows():
+        if row["item_name"].lower() in search_lower:
+            return pd.DataFrame([row])
+
+    return pd.DataFrame()
+
 @tool
 def inventory_tool(item_name: Union[str, int], as_of_date: str) -> str:
     """Check stock level for a paper product and whether reorder is needed.
 
     Args:
-        item_name: The exact name of the product to look up (e.g. 'A4 paper'),
-                   or the closest match if the exact name is not found.
-        as_of_date: The date to check stock as of, in YYYY-MM-DD format.
+        item_name: The customer's description of the product (e.g. 'A4 glossy paper').
+                   The tool resolves this to the closest catalog name automatically.
+        as_of_date: The date to check stock as of, in YYYY-MM-DD format. Use the
+                    date from the customer's request.
     """
     item_name = str(item_name)
-    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    as_of_date = _clamp_date(as_of_date)
+    inv = _find_catalog_row(item_name)
     if inv.empty:
-        inv = pd.read_sql("SELECT * FROM inventory WHERE item_name LIKE :n", db_engine, params={"n": f"%{item_name}%"})
-    if inv.empty:
-        return f"{item_name} not found in inventory."
+        return json.dumps({"found": False, "item_name": item_name,
+                           "message": f"{item_name} not found in catalog."})
     row = inv.iloc[0]
     matched_name = row["item_name"]
     stock_df = get_stock_level(matched_name, as_of_date)
     stock = int(stock_df["current_stock"].iloc[0])
     return json.dumps({
+        "found": True,
         "item_name": matched_name,
         "current_stock": stock,
         "min_stock_level": int(row["min_stock_level"]),
         "unit_price": float(row["unit_price"]),
-        "needs_reorder": stock < int(row["min_stock_level"])
+        "needs_reorder": stock < int(row["min_stock_level"]),
     })
 
 @tool
@@ -680,20 +726,37 @@ def quote_tool(item_name: Union[str, int], quantity: int, as_of_date: str) -> st
         as_of_date: The date of the quote request in YYYY-MM-DD format.
     """
     item_name = str(item_name)
-    inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
+    as_of_date = _clamp_date(as_of_date)
+    inv = _find_catalog_row(item_name)
     if inv.empty:
-        return f"No pricing found for {item_name}."
+        return json.dumps({"error": f"No pricing found for '{item_name}'. Item not in catalog."})
+    matched_name = inv.iloc[0]["item_name"]
     unit_price = float(inv.iloc[0]["unit_price"])
     discount = 0.15 if quantity >= 1000 else 0.10 if quantity >= 500 else 0.05 if quantity >= 100 else 0.0
     discounted = unit_price * (1 - discount)
-    history = search_quote_history([item_name], limit=3)
+    history = search_quote_history([matched_name], limit=3)
     return json.dumps({
-        "item_name": item_name, "quantity": quantity,
+        "item_name": matched_name, "quantity": quantity,
         "unit_price": unit_price, "discount_pct": discount * 100,
         "discounted_unit_price": round(discounted, 4),
         "total_quote": round(discounted * quantity, 2),
         "similar_past_quotes": history
     })
+
+@tool
+def list_available_inventory(as_of_date: str) -> str:
+    """List every item currently in stock with its quantity. Call this first to discover
+    the exact catalog names before calling inventory_tool or passing names to sales_agent.
+
+    Args:
+        as_of_date: The date to check inventory as of, in YYYY-MM-DD format.
+                    Use the date from the customer's request.
+    """
+    clamped = _clamp_date(as_of_date)
+    inventory = get_all_inventory(clamped)
+    if not inventory:
+        return json.dumps({"message": "No items currently in stock.", "available_items": {}})
+    return json.dumps({"available_items": inventory, "total_unique_items": len(inventory)})
 
 @tool
 def place_order_tool(item_name: Union[str, int], quantity: int, unit_price: float, transaction_date: str) -> str:
@@ -712,10 +775,14 @@ def place_order_tool(item_name: Union[str, int], quantity: int, unit_price: floa
                        "total_revenue": round(quantity * unit_price, 2)})
 
 inventory_agent = ToolCallingAgent(
-    tools=[inventory_tool, delivery_tool],
+    tools=[list_available_inventory, inventory_tool, delivery_tool],
     model=model,
     name="inventory_agent",
-    description="Checks stock levels for products and estimates supplier delivery timelines.",
+    description=(
+        "Checks stock levels and delivery timelines for paper products. "
+        "Call list_available_inventory first to see exact catalog names, "
+        "then use inventory_tool with the matching catalog name."
+    ),
     max_steps=10
 )
 
@@ -739,7 +806,16 @@ orchestrator = ToolCallingAgent(
     tools=[],
     model=model,
     managed_agents=[inventory_agent, sales_agent, financial_agent],
-    max_steps=15
+    max_steps=15,
+    instructions=(
+        "You are the orchestrator for a paper supply company. "
+        "For EVERY customer request you MUST complete ALL of the following steps in order:\n"
+        "1. Call inventory_agent to check stock availability and get the exact catalog item name.\n"
+        "2. If stock is available, call sales_agent to generate a price quote using the exact catalog item name returned by inventory_agent.\n"
+        "3. After the quote is generated, call sales_agent again to place the order with place_order_tool, "
+        "recording the sale in the database using the exact catalog item name, quantity, discounted unit price, and request date.\n"
+        "Do NOT stop after step 1 or step 2. Always complete the sale transaction in step 3 when stock is available."
+    ),
 )
 
 
@@ -777,6 +853,7 @@ def run_limited_test():
 
 
 def run_test_scenarios():
+    
     results = []
     # write the test output to a markdown file
     with TeeOutput("all_test_scenarios.md", "All Test Scenarios"):
@@ -807,7 +884,10 @@ def run_test_scenarios():
             print(f"Inventory Value: ${current_inventory:.2f}")
 
             # Process request
-            request_with_date = f"{row['request']} (Date of request: {request_date})"
+            request_with_date = (
+                f"{row['request']} (Date of request: {request_date}). "
+                "Check inventory, and if the item is in stock, generate a quote and place the order to complete the sale."
+            )
 
             try:
                 response = orchestrator.run(request_with_date)
