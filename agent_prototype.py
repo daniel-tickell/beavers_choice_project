@@ -631,7 +631,7 @@ model = OpenAIServerModel(
  and apply criteria to them to ensure that the flow of the system is correct."""
 
 @tool
-def inventory_tool(item_name: str, as_of_date: str) -> str:
+def inventory_tool(item_name: Union[str, int], as_of_date: str) -> str:
     """Check stock level for a paper product and whether reorder is needed.
 
     Args:
@@ -639,6 +639,7 @@ def inventory_tool(item_name: str, as_of_date: str) -> str:
                    or the closest match if the exact name is not found.
         as_of_date: The date to check stock as of, in YYYY-MM-DD format.
     """
+    item_name = str(item_name)
     inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
     if inv.empty:
         inv = pd.read_sql("SELECT * FROM inventory WHERE item_name LIKE :n", db_engine, params={"n": f"%{item_name}%"})
@@ -657,7 +658,7 @@ def inventory_tool(item_name: str, as_of_date: str) -> str:
     })
 
 @tool
-def delivery_tool(item_name: str, quantity: int, request_date: str) -> str:
+def delivery_tool(item_name: Union[str, int], quantity: int, request_date: str) -> str:
     """Estimate the supplier delivery date for a product order.
 
     Args:
@@ -665,11 +666,12 @@ def delivery_tool(item_name: str, quantity: int, request_date: str) -> str:
         quantity: Number of units to order.
         request_date: The order start date in YYYY-MM-DD format.
     """
+    item_name = str(item_name)
     delivery = get_supplier_delivery_date(request_date, quantity)
     return json.dumps({"item_name": item_name, "quantity": quantity, "estimated_delivery": delivery})
 
 @tool
-def quote_tool(item_name: str, quantity: int, as_of_date: str) -> str:
+def quote_tool(item_name: Union[str, int], quantity: int, as_of_date: str) -> str:
     """Generate a price quote with bulk discounts and attach similar historical quotes.
 
     Args:
@@ -677,6 +679,7 @@ def quote_tool(item_name: str, quantity: int, as_of_date: str) -> str:
         quantity: Number of units the customer wants to purchase.
         as_of_date: The date of the quote request in YYYY-MM-DD format.
     """
+    item_name = str(item_name)
     inv = pd.read_sql("SELECT * FROM inventory WHERE item_name = :n", db_engine, params={"n": item_name})
     if inv.empty:
         return f"No pricing found for {item_name}."
@@ -693,7 +696,7 @@ def quote_tool(item_name: str, quantity: int, as_of_date: str) -> str:
     })
 
 @tool
-def place_order_tool(item_name: str, quantity: int, unit_price: float, transaction_date: str) -> str:
+def place_order_tool(item_name: Union[str, int], quantity: int, unit_price: float, transaction_date: str) -> str:
     """Record a completed sale in the database. Only call after confirming stock is available.
 
     Args:
@@ -702,6 +705,7 @@ def place_order_tool(item_name: str, quantity: int, unit_price: float, transacti
         unit_price: The per-unit price after any discounts.
         transaction_date: The date of the transaction in YYYY-MM-DD format.
     """
+    item_name = str(item_name)
     tx_id = create_transaction(item_name, "sales", quantity, quantity * unit_price, transaction_date)
     return json.dumps({"status": "success", "transaction_id": tx_id,
                        "item_name": item_name, "quantity_sold": quantity,
@@ -711,20 +715,31 @@ inventory_agent = ToolCallingAgent(
     tools=[inventory_tool, delivery_tool],
     model=model,
     name="inventory_agent",
-    description="Checks stock levels for products and estimates supplier delivery timelines."
+    description="Checks stock levels for products and estimates supplier delivery timelines.",
+    max_steps=10
 )
 
 sales_agent = ToolCallingAgent(
     tools=[quote_tool, place_order_tool],
     model=model,
     name="sales_agent",
-    description="Generates price quotes with bulk discounts and records completed sales in the database."
+    description="Generates price quotes with bulk discounts and records completed sales in the database.",
+    max_steps=10
 )
 
-orchestrator = CodeAgent(
+financial_agent = ToolCallingAgent(
+    tools=[get_all_inventory, get_cash_balance, generate_financial_report],
+    model=model,
+    name="financial_agent",
+    description="Retrieves inventory snapshots, cash balances, and generates full financial reports.",
+    max_steps=10
+)
+
+orchestrator = ToolCallingAgent(
     tools=[],
     model=model,
-    managed_agents=[inventory_agent, sales_agent]
+    managed_agents=[inventory_agent, sales_agent, financial_agent],
+    max_steps=15
 )
 
 
@@ -781,12 +796,6 @@ def run_test_scenarios():
         report = generate_financial_report(initial_date)
         current_cash = report["cash_balance"]
         current_inventory = report["inventory_value"]
-
-        orchestrator = CodeAgent(
-            tools=[],
-            model=model,
-            managed_agents=[inventory_agent, sales_agent]
-        )
 
         for idx, row in quote_requests_sample.iterrows():
             request_date = row["request_date"].strftime("%Y-%m-%d")
@@ -846,6 +855,6 @@ if __name__ == "__main__":
     print("\n--- Available Inventory Items ---")
     print(inventory_df.head(25))
            
-    #run_test_scenarios() # Uncomment to run full test scenarios with quote_requests_sample.csv
-    run_limited_test() # Run a single test with a known item and quantity to verify end-to-end functionality
+    run_test_scenarios() # Uncomment to run full test scenarios with quote_requests_sample.csv
+    #run_limited_test() # Run a single test with a known item and quantity to verify end-to-end functionality
    
